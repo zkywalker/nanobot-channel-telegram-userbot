@@ -30,7 +30,7 @@ nanobot 的 Telegram Client API 插件，使用 [Telethon](https://github.com/Lo
 ```bash
 # 放在 nanobot 同级目录
 cd /path/to/your/projects
-git clone https://github.com/zkywalker/telegram-client-sikill.git
+git clone https://github.com/zkywalker/nanobot-telegram-client.git
 ```
 
 ### 2. 安装依赖
