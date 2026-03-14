@@ -29,37 +29,39 @@ nanobot 的 Telegram Userbot 插件，使用 [Telethon](https://github.com/Lonam
 ### 1. 克隆本仓库
 
 ```bash
-# 放在 nanobot 同级目录
 cd /path/to/your/projects
 git clone https://github.com/zkywalker/nanobot-channel-telegram-userbot.git
 ```
 
-### 2. 安装依赖
-
-```bash
-pip install telethon pysocks
-```
-
-### 3. 运行安装脚本
+### 2. 运行安装脚本
 
 ```bash
 cd nanobot-channel-telegram-userbot
-python install.py --nanobot-dir /path/to/nanobot
+python install.py
 ```
 
-安装脚本只做一件事：在 `nanobot/channels/` 下创建两个 symlink，**不修改任何 nanobot 源码**。
+安装脚本会自动完成：
+- 安装 Python 依赖（`telethon`、`pysocks`）到 nanobot 的运行环境中
+- 自动检测 nanobot 的安装位置（支持 `uv tool`、`pip`、editable install）
+- 在 nanobot 的 `channels/` 目录下创建 symlink
 
-### 4. 首次认证
+> 也可以手动指定 nanobot 源码目录：`python install.py --nanobot-dir /path/to/nanobot`
+
+### 3. 首次认证
 
 ```bash
-# 交互式登录，生成 session 文件
 python auth.py --api-id YOUR_API_ID --phone +8613800138000
 
 # 会提示输入 api_hash（隐藏输入）和验证码
 # session 文件保存到 ~/.nanobot/nanobot_userbot.session
 ```
 
-可选参数：
+> auth.py 会自动检测系统代理环境变量（`all_proxy`、`https_proxy`、`http_proxy`），也可以手动指定：
+> ```bash
+> python auth.py --api-id 12345 --phone +8613800138000 --proxy socks5://127.0.0.1:1080
+> ```
+
+其他可选参数：
 
 ```bash
 # 自定义 session 名
@@ -67,12 +69,9 @@ python auth.py --api-id 12345 --phone +8613800138000 --session my_account
 
 # 导出 StringSession（适合 Docker / 无状态部署）
 python auth.py --api-id 12345 --phone +8613800138000 --export-string
-
-# 通过代理连接
-python auth.py --api-id 12345 --phone +8613800138000 --proxy socks5://127.0.0.1:1080
 ```
 
-### 5. 配置 nanobot
+### 4. 配置 nanobot
 
 在 `~/.nanobot/config.json` 中添加：
 
@@ -90,7 +89,7 @@ python auth.py --api-id 12345 --phone +8613800138000 --proxy socks5://127.0.0.1:
 }
 ```
 
-### 6. 启动
+### 5. 启动
 
 ```bash
 nanobot gateway
@@ -116,7 +115,7 @@ nanobot gateway
 ## 卸载
 
 ```bash
-python uninstall.py --nanobot-dir /path/to/nanobot
+python uninstall.py
 ```
 
 仅移除 symlink，不修改任何文件。`~/.nanobot/` 下的 session 文件会保留。
@@ -128,7 +127,7 @@ nanobot-channel-telegram-userbot/
 ├── channel/
 │   ├── telegram_userbot.py  # TelegramUserbotChannel + TelegramUserbotConfig
 │   └── utils.py             # 独立工具函数（可被其他项目复用）
-├── install.py               # 创建 symlink
+├── install.py               # 安装（依赖 + symlink）
 ├── uninstall.py             # 移除 symlink
 ├── auth.py                  # 认证工具
 └── requirements.txt

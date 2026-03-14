@@ -29,6 +29,27 @@ from pathlib import Path
 
 MAX_CODE_RETRIES = 3
 
+REQUIRED_PACKAGES = {
+    "telethon": "telethon",
+    "socks": "pysocks",
+}
+
+
+def check_dependencies() -> None:
+    """Check that all required packages are installed, exit with clear message if not."""
+    missing = []
+    for import_name, pip_name in REQUIRED_PACKAGES.items():
+        try:
+            __import__(import_name)
+        except ImportError:
+            missing.append(pip_name)
+    if missing:
+        print("Error: missing required dependencies:", file=sys.stderr)
+        for pkg in missing:
+            print(f"  - {pkg}", file=sys.stderr)
+        print(f"\nInstall them with:\n  pip install {' '.join(missing)}", file=sys.stderr)
+        sys.exit(1)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -49,17 +70,13 @@ def parse_args() -> argparse.Namespace:
 
 
 async def authenticate(args: argparse.Namespace) -> None:
-    try:
-        from telethon import TelegramClient
-        from telethon.errors import (
-            PhoneCodeExpiredError,
-            PhoneCodeInvalidError,
-            SessionPasswordNeededError,
-        )
-        from telethon.sessions import StringSession
-    except ImportError:
-        print("Error: telethon is not installed. Run: pip install telethon", file=sys.stderr)
-        sys.exit(1)
+    from telethon import TelegramClient
+    from telethon.errors import (
+        PhoneCodeExpiredError,
+        PhoneCodeInvalidError,
+        SessionPasswordNeededError,
+    )
+    from telethon.sessions import StringSession
 
     # Prompt for api_hash securely if not provided via CLI
     api_hash = args.api_hash
@@ -86,16 +103,29 @@ async def authenticate(args: argparse.Namespace) -> None:
         session_dir.mkdir(parents=True, exist_ok=True)
         session = str(session_dir / args.session)
 
-    # Parse proxy
+    # Parse proxy — use --proxy if given, otherwise auto-detect from environment
+    proxy_url = args.proxy
+    if not proxy_url:
+        proxy_url = (
+            os.environ.get("all_proxy")
+            or os.environ.get("ALL_PROXY")
+            or os.environ.get("https_proxy")
+            or os.environ.get("HTTPS_PROXY")
+            or os.environ.get("http_proxy")
+            or os.environ.get("HTTP_PROXY")
+        )
+        if proxy_url:
+            print(f"Auto-detected proxy from environment: {proxy_url}")
+
     proxy = None
-    if args.proxy:
+    if proxy_url:
         try:
             sys.path.insert(0, str(Path(__file__).parent))
             from channel.telegram_userbot import parse_proxy_url
-            proxy = parse_proxy_url(args.proxy)
+            proxy = parse_proxy_url(proxy_url)
         except ImportError:
             from urllib.parse import urlparse
-            parsed = urlparse(args.proxy)
+            parsed = urlparse(proxy_url)
             if parsed.scheme in ("socks5", "socks4", "http"):
                 proxy = {
                     "proxy_type": parsed.scheme,
@@ -190,6 +220,7 @@ async def authenticate(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    check_dependencies()
     args = parse_args()
     asyncio.run(authenticate(args))
 

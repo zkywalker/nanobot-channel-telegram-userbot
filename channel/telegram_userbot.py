@@ -18,6 +18,8 @@ banned or restricted. See https://core.telegram.org/api/terms
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import os
 import time
 from datetime import datetime, timezone
@@ -59,6 +61,7 @@ from nanobot.channels.telegram_userbot_utils import (
 )
 
 # --- nanobot integration imports (replace these for other frameworks) ---
+from nanobot.agent.tools.base import Tool
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
@@ -89,6 +92,8 @@ class TelegramUserbotConfig(BaseModel):
     reply_to_message: bool = False
     reaction_emoji: str = ""  # React to incoming messages (e.g. "👀", "👍"). Empty = disabled
     auto_disclosure: str = ""  # Text appended to every outbound message (e.g. "[AI]")
+    deny_policy: Literal["ignore", "reply"] = "ignore"  # "ignore": silently drop; "reply": send deny_message
+    deny_message: str = "Sorry, I'm not available right now."  # Reply text when deny_policy="reply"
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +149,8 @@ class TelegramUserbotChannel(BaseChannel):
         self._start_time: float = 0.0  # For filtering stale messages
         # Track sent message IDs for deletion support
         self._sent_messages: dict[str, list[int]] = {}  # chat_id -> [msg_ids]
+        # Progress message editing: one placeholder per chat, edited in-place
+        self._progress_msg_ids: dict[str, int] = {}  # chat_id -> msg_id of the progress placeholder
 
     # ---- session / auth / lifecycle --------------------------------------
 
@@ -510,9 +517,11 @@ class TelegramUserbotChannel(BaseChannel):
         elif getattr(msg, "gif", None):
             media_type = "animation"
         elif getattr(msg, "sticker", None):
-            # Don't download sticker, but provide content tag
+            # Don't download sticker, but provide content tag and metadata
             sticker = msg.sticker
             alt = getattr(sticker, "alt", None) or ""
+            # Attach sticker object to msg for metadata extraction
+            msg._nanobot_sticker = sticker
             return [], [f"[sticker: {alt}]" if alt else "[sticker]"]
         elif getattr(msg, "document", None):
             media_type = "file"
@@ -655,6 +664,18 @@ class TelegramUserbotChannel(BaseChannel):
         sender_id = self._sender_id_str(sender)
         chat_id = str(event.chat_id)
 
+        # ---- Early allowlist check (before typing / media download) ----
+        if not self.is_allowed(sender_id):
+            deny_policy = getattr(self.config, "deny_policy", "ignore")
+            if deny_policy == "reply":
+                deny_msg = getattr(self.config, "deny_message", "Sorry, I'm not available right now.")
+                try:
+                    await event.reply(deny_msg)
+                except Exception as e:
+                    logger.debug("Failed to send deny message: {}", e)
+            logger.debug("Denied message from {} (policy={})", sender_id, deny_policy)
+            return
+
         self._remember_thread_context(event)
 
         # Recognize slash commands
@@ -711,6 +732,43 @@ class TelegramUserbotChannel(BaseChannel):
         logger.debug("Telegram Userbot message from {}: {}...", sender_id, content[:50])
 
         metadata = self._build_message_metadata(event, sender)
+
+        # Extract sticker metadata if present
+        msg = getattr(event, "message", event)
+        sticker = getattr(msg, "_nanobot_sticker", None)
+        if sticker:
+            # Extract sticker set name from attributes
+            set_name = ""
+            is_animated = False
+            is_video = False
+            for attr in getattr(sticker, "attributes", []):
+                cls_name = type(attr).__name__
+                if cls_name == "DocumentAttributeSticker":
+                    stickerset = getattr(attr, "stickerset", None)
+                    if stickerset:
+                        set_name = getattr(stickerset, "short_name", "") or ""
+                    alt = getattr(attr, "alt", "") or ""
+                elif cls_name == "DocumentAttributeCustomEmoji":
+                    alt = getattr(attr, "alt", "") or ""
+                elif cls_name == "DocumentAttributeFilename":
+                    pass
+                elif cls_name == "DocumentAttributeAnimated":
+                    is_animated = True
+                elif cls_name == "DocumentAttributeVideo":
+                    is_video = True
+
+            file_ref = getattr(sticker, "file_reference", b"") or b""
+            metadata["sticker"] = {
+                "id": sticker.id,
+                "access_hash": getattr(sticker, "access_hash", None),
+                "file_reference": base64.b64encode(file_ref).decode() if file_ref else "",
+                "emoji": getattr(sticker, "alt", "") or "",
+                "set_name": set_name,
+                "mime_type": getattr(sticker, "mime_type", "") or "",
+                "is_animated": is_animated,
+                "is_video": is_video,
+            }
+
         session_key = self._derive_topic_session_key(event)
 
         # Media group buffering
@@ -764,6 +822,9 @@ class TelegramUserbotChannel(BaseChannel):
             return  # Only handle text edits
 
         sender_id = self._sender_id_str(sender)
+        if not self.is_allowed(sender_id):
+            return
+
         chat_id = str(event.chat_id)
         content = f"[edited message] {raw_text}"
         metadata = self._build_message_metadata(event, sender)
@@ -1067,15 +1128,38 @@ class TelegramUserbotChannel(BaseChannel):
 
         return dialogs
 
+    # ---- channel tools for agent registration -----------------------------
+
+    def get_tools(self) -> list[Tool]:
+        """Return Telegram-specific tools for agent registration."""
+        return [
+            TelegramSendStickerTool(self),
+            TelegramForwardMessageTool(self),
+            TelegramSendReactionTool(self),
+            TelegramSetProfileTool(self),
+            TelegramSetProfilePhotoTool(self),
+            TelegramSendFileTool(self),
+            TelegramSearchMessagesTool(self),
+            TelegramGetHistoryTool(self),
+        ]
+
     # ---- outbound message sending ----------------------------------------
 
     async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through Telegram Userbot API."""
+        """Send a message through Telegram Userbot API.
+
+        Progress messages are consolidated into a single editable placeholder
+        so the user sees one updating line instead of many "·" messages.
+        The final response edits that placeholder in-place — the user sees a
+        smooth transition from status text to the actual answer, like streaming.
+        """
         if not self._client:
             logger.warning("Telegram Userbot not running")
             return
 
-        if not msg.metadata.get("_progress", False):
+        is_progress = msg.metadata.get("_progress", False)
+
+        if not is_progress:
             self._stop_typing(msg.chat_id)
 
         try:
@@ -1099,8 +1183,25 @@ class TelegramUserbotChannel(BaseChannel):
         if message_thread_id and not effective_reply_to:
             effective_reply_to = message_thread_id
 
+        # ---- Progress messages: edit a single placeholder in-place ----
+        if is_progress:
+            await self._handle_progress_message(chat_id, msg.chat_id, msg.content, effective_reply_to)
+            return
+
+        # ---- Final response: edit progress placeholder into first chunk ----
+        placeholder_id = self._progress_msg_ids.pop(msg.chat_id, None)
+
         # Append AI disclosure if configured
         disclosure = getattr(self.config, "auto_disclosure", "")
+
+        # If response has media, delete placeholder (can't edit text into a file)
+        # and send media normally
+        if msg.media and placeholder_id:
+            try:
+                await self._client.delete_messages(chat_id, [placeholder_id])
+            except Exception:
+                pass
+            placeholder_id = None
 
         # Send media files
         for media_path in msg.media or []:
@@ -1130,15 +1231,84 @@ class TelegramUserbotChannel(BaseChannel):
                 except Exception:
                     pass
 
-        # Send text content
+        # Send text content — edit first chunk into placeholder, send rest as new
         if msg.content and msg.content != "[empty message]":
             text = msg.content
             if disclosure:
                 text = f"{text}\n\n{disclosure}"
-            for chunk in split_message(text, TELEGRAM_MAX_MESSAGE_LEN):
+            chunks = split_message(text, TELEGRAM_MAX_MESSAGE_LEN)
+            for i, chunk in enumerate(chunks):
+                if i == 0 and placeholder_id:
+                    # Edit the progress placeholder into the final answer
+                    edited = await self._edit_as_final(chat_id, placeholder_id, chunk)
+                    if edited:
+                        self._track_sent_message(msg.chat_id, placeholder_id)
+                        continue
+                    # Edit failed — fall through to send as new message
                 sent_id = await self._send_text(chat_id, chunk, effective_reply_to)
                 if sent_id:
                     self._track_sent_message(msg.chat_id, sent_id)
+        elif placeholder_id:
+            # No text content but placeholder exists — clean it up
+            try:
+                await self._client.delete_messages(chat_id, [placeholder_id])
+            except Exception:
+                pass
+
+    async def _handle_progress_message(
+        self,
+        chat_id: int,
+        chat_id_str: str,
+        content: str,
+        reply_to: int | None,
+    ) -> None:
+        """Send or edit a progress placeholder message."""
+        text = content or "·"
+        existing_id = self._progress_msg_ids.get(chat_id_str)
+
+        if existing_id:
+            # Edit the existing placeholder
+            try:
+                await self._client.edit_message(chat_id, existing_id, text)
+                return
+            except Exception:
+                # Edit failed (message deleted, too old, etc.) — fall through to send new
+                self._progress_msg_ids.pop(chat_id_str, None)
+
+        # Send a new placeholder
+        try:
+            sent = await self._client.send_message(
+                chat_id, text, reply_to=reply_to, link_preview=False,
+            )
+            self._progress_msg_ids[chat_id_str] = sent.id
+        except Exception as e:
+            logger.debug("Failed to send progress placeholder: {}", e)
+
+    async def _edit_as_final(self, chat_id: int, msg_id: int, text: str) -> bool:
+        """Edit a placeholder message into the final formatted response.
+
+        Returns True on success, False if the edit failed.
+        """
+        if not self._client:
+            return False
+        try:
+            html = markdown_to_telegram_html(text)
+            await self._client.edit_message(chat_id, msg_id, html, parse_mode="html", link_preview=False)
+            return True
+        except Exception as e:
+            logger.debug("Failed to edit placeholder into final response: {}", e)
+            # Try plain text fallback
+            try:
+                await self._client.edit_message(chat_id, msg_id, text, link_preview=False)
+                return True
+            except Exception:
+                pass
+            # Clean up the failed placeholder
+            try:
+                await self._client.delete_messages(chat_id, [msg_id])
+            except Exception:
+                pass
+            return False
 
     def _track_sent_message(self, chat_id: str, msg_id: int) -> None:
         """Track sent message IDs for potential deletion later."""
@@ -1184,3 +1354,472 @@ class TelegramUserbotChannel(BaseChannel):
             except Exception as e2:
                 logger.error("Error sending Telegram Userbot message: {}", e2)
         return None
+
+
+# ===========================================================================
+# Channel Tools — registered with the agent via get_tools()
+# ===========================================================================
+
+
+class _TelegramChannelTool(Tool):
+    """Base for Telegram channel tools that hold a reference to the channel."""
+
+    def __init__(self, channel: TelegramUserbotChannel):
+        self._channel = channel
+
+
+class TelegramSendStickerTool(_TelegramChannelTool):
+    """Send a sticker to a Telegram chat."""
+
+    @property
+    def name(self) -> str:
+        return "telegram_send_sticker"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Send a sticker to a Telegram chat. You can specify the sticker by its "
+            "document id+access_hash+file_reference (from received sticker metadata), "
+            "or by sticker set name + emoji to pick the matching sticker from a pack."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "string",
+                    "description": "Target chat ID",
+                },
+                "sticker_id": {
+                    "type": "integer",
+                    "description": "Sticker document ID (from sticker metadata)",
+                },
+                "access_hash": {
+                    "type": "integer",
+                    "description": "Sticker access hash (from sticker metadata)",
+                },
+                "file_reference": {
+                    "type": "string",
+                    "description": "Base64-encoded file reference (from sticker metadata)",
+                },
+                "set_name": {
+                    "type": "string",
+                    "description": "Sticker set short name (to find sticker by emoji)",
+                },
+                "emoji": {
+                    "type": "string",
+                    "description": "Emoji to find in the sticker set",
+                },
+                "reply_to": {
+                    "type": "integer",
+                    "description": "Message ID to reply to (optional)",
+                },
+            },
+            "required": ["chat_id"],
+        }
+
+    async def execute(self, **kwargs: Any) -> str:
+        client = self._channel._client
+        if not client:
+            return "Error: Telegram client not connected"
+
+        chat_id = int(kwargs["chat_id"])
+        sticker_id = kwargs.get("sticker_id")
+        access_hash = kwargs.get("access_hash")
+        file_ref_b64 = kwargs.get("file_reference", "")
+        set_name = kwargs.get("set_name", "")
+        emoji = kwargs.get("emoji", "")
+        reply_to = kwargs.get("reply_to")
+
+        try:
+            from telethon.tl.types import InputDocument
+
+            if sticker_id and access_hash is not None:
+                # Send by document ID
+                file_ref = base64.b64decode(file_ref_b64) if file_ref_b64 else b""
+                input_doc = InputDocument(
+                    id=int(sticker_id),
+                    access_hash=int(access_hash),
+                    file_reference=file_ref,
+                )
+                await client.send_file(
+                    chat_id, input_doc, reply_to=reply_to,
+                )
+                return "Sticker sent successfully"
+
+            if set_name and emoji:
+                # Find sticker in set by emoji
+                from telethon.tl.functions.messages import GetStickerSetRequest
+                from telethon.tl.types import InputStickerSetShortName
+
+                result = await client(GetStickerSetRequest(
+                    stickerset=InputStickerSetShortName(short_name=set_name),
+                    hash=0,
+                ))
+                # Match by emoji in pack
+                for pack in result.packs:
+                    if pack.emoticon == emoji:
+                        if pack.documents:
+                            doc_id = pack.documents[0]
+                            # Find the document
+                            for doc in result.documents:
+                                if doc.id == doc_id:
+                                    input_doc = InputDocument(
+                                        id=doc.id,
+                                        access_hash=doc.access_hash,
+                                        file_reference=doc.file_reference,
+                                    )
+                                    await client.send_file(
+                                        chat_id, input_doc, reply_to=reply_to,
+                                    )
+                                    return "Sticker sent successfully"
+                return f"No sticker found for emoji '{emoji}' in set '{set_name}'"
+
+            return "Error: provide sticker_id+access_hash or set_name+emoji"
+        except Exception as e:
+            return f"Error sending sticker: {e}"
+
+
+class TelegramForwardMessageTool(_TelegramChannelTool):
+    """Forward messages between Telegram chats."""
+
+    @property
+    def name(self) -> str:
+        return "telegram_forward_message"
+
+    @property
+    def description(self) -> str:
+        return "Forward one or more messages from one Telegram chat to another."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "from_chat_id": {
+                    "type": "string",
+                    "description": "Source chat ID",
+                },
+                "to_chat_id": {
+                    "type": "string",
+                    "description": "Destination chat ID",
+                },
+                "message_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "List of message IDs to forward",
+                },
+            },
+            "required": ["from_chat_id", "to_chat_id", "message_ids"],
+        }
+
+    async def execute(self, **kwargs: Any) -> str:
+        ok = await self._channel.forward_message(
+            from_chat_id=kwargs["from_chat_id"],
+            to_chat_id=kwargs["to_chat_id"],
+            message_ids=kwargs["message_ids"],
+        )
+        return "Messages forwarded successfully" if ok else "Error: failed to forward messages"
+
+
+class TelegramSendReactionTool(_TelegramChannelTool):
+    """Send an emoji reaction to a message."""
+
+    @property
+    def name(self) -> str:
+        return "telegram_send_reaction"
+
+    @property
+    def description(self) -> str:
+        return "Send an emoji reaction to a specific message in a Telegram chat."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "string",
+                    "description": "Chat ID containing the message",
+                },
+                "message_id": {
+                    "type": "integer",
+                    "description": "Message ID to react to",
+                },
+                "emoji": {
+                    "type": "string",
+                    "description": "Reaction emoji (e.g. '👍', '❤️', '🔥')",
+                },
+            },
+            "required": ["chat_id", "message_id", "emoji"],
+        }
+
+    async def execute(self, **kwargs: Any) -> str:
+        client = self._channel._client
+        if not client:
+            return "Error: Telegram client not connected"
+
+        try:
+            chat_id = int(kwargs["chat_id"])
+            await client(SendReactionRequest(
+                peer=chat_id,
+                msg_id=kwargs["message_id"],
+                reaction=[ReactionEmoji(emoticon=kwargs["emoji"])],
+            ))
+            return "Reaction sent successfully"
+        except Exception as e:
+            return f"Error sending reaction: {e}"
+
+
+class TelegramSetProfileTool(_TelegramChannelTool):
+    """Update the Telegram account profile."""
+
+    @property
+    def name(self) -> str:
+        return "telegram_set_profile"
+
+    @property
+    def description(self) -> str:
+        return "Update the Telegram account first name, last name, or bio/about."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "first_name": {
+                    "type": "string",
+                    "description": "New first name (optional)",
+                },
+                "last_name": {
+                    "type": "string",
+                    "description": "New last name (optional)",
+                },
+                "about": {
+                    "type": "string",
+                    "description": "New bio/about text (optional)",
+                },
+            },
+        }
+
+    async def execute(self, **kwargs: Any) -> str:
+        client = self._channel._client
+        if not client:
+            return "Error: Telegram client not connected"
+
+        try:
+            from telethon.tl.functions.account import UpdateProfileRequest
+
+            update_kwargs: dict[str, str] = {}
+            if "first_name" in kwargs:
+                update_kwargs["first_name"] = kwargs["first_name"]
+            if "last_name" in kwargs:
+                update_kwargs["last_name"] = kwargs["last_name"]
+            if "about" in kwargs:
+                update_kwargs["about"] = kwargs["about"]
+
+            if not update_kwargs:
+                return "Error: provide at least one field to update"
+
+            await client(UpdateProfileRequest(**update_kwargs))
+            return "Profile updated successfully"
+        except Exception as e:
+            return f"Error updating profile: {e}"
+
+
+class TelegramSetProfilePhotoTool(_TelegramChannelTool):
+    """Set the Telegram account profile photo."""
+
+    @property
+    def name(self) -> str:
+        return "telegram_set_profile_photo"
+
+    @property
+    def description(self) -> str:
+        return "Set or update the Telegram account profile photo from a local image file."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Local path to the image file for the new profile photo",
+                },
+            },
+            "required": ["file_path"],
+        }
+
+    async def execute(self, **kwargs: Any) -> str:
+        client = self._channel._client
+        if not client:
+            return "Error: Telegram client not connected"
+
+        file_path = kwargs["file_path"]
+        if not Path(file_path).exists():
+            return f"Error: file not found: {file_path}"
+
+        try:
+            from telethon.tl.functions.photos import UploadProfilePhotoRequest
+
+            file = await client.upload_file(file_path)
+            await client(UploadProfilePhotoRequest(file=file))
+            return "Profile photo updated successfully"
+        except Exception as e:
+            return f"Error updating profile photo: {e}"
+
+
+class TelegramSendFileTool(_TelegramChannelTool):
+    """Send a file to a Telegram chat."""
+
+    @property
+    def name(self) -> str:
+        return "telegram_send_file"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Send a file (photo, video, document, voice note) to a Telegram chat. "
+            "Provide a local file path."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "string",
+                    "description": "Target chat ID",
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": "Local path to the file to send",
+                },
+                "caption": {
+                    "type": "string",
+                    "description": "Optional caption for the file",
+                },
+                "voice_note": {
+                    "type": "boolean",
+                    "description": "Send as voice note (for audio files)",
+                },
+                "reply_to": {
+                    "type": "integer",
+                    "description": "Message ID to reply to (optional)",
+                },
+            },
+            "required": ["chat_id", "file_path"],
+        }
+
+    async def execute(self, **kwargs: Any) -> str:
+        client = self._channel._client
+        if not client:
+            return "Error: Telegram client not connected"
+
+        file_path = kwargs["file_path"]
+        if not Path(file_path).exists():
+            return f"Error: file not found: {file_path}"
+
+        try:
+            send_kwargs: dict[str, Any] = {}
+            if kwargs.get("caption"):
+                send_kwargs["caption"] = kwargs["caption"]
+            if kwargs.get("voice_note"):
+                send_kwargs["voice_note"] = True
+            if kwargs.get("reply_to"):
+                send_kwargs["reply_to"] = kwargs["reply_to"]
+
+            await client.send_file(int(kwargs["chat_id"]), file_path, **send_kwargs)
+            return "File sent successfully"
+        except Exception as e:
+            return f"Error sending file: {e}"
+
+
+class TelegramSearchMessagesTool(_TelegramChannelTool):
+    """Search messages in a Telegram chat."""
+
+    @property
+    def name(self) -> str:
+        return "telegram_search_messages"
+
+    @property
+    def description(self) -> str:
+        return "Search for messages containing a query string in a Telegram chat."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "string",
+                    "description": "Chat ID to search in",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Search query text",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of results (default 10)",
+                },
+            },
+            "required": ["chat_id", "query"],
+        }
+
+    async def execute(self, **kwargs: Any) -> str:
+        results = await self._channel.search_messages(
+            chat_id=kwargs["chat_id"],
+            query=kwargs["query"],
+            limit=kwargs.get("limit", 10),
+        )
+        if not results:
+            return "No messages found"
+        return json.dumps(results, ensure_ascii=False)
+
+
+class TelegramGetHistoryTool(_TelegramChannelTool):
+    """Get message history from a Telegram chat."""
+
+    @property
+    def name(self) -> str:
+        return "telegram_get_history"
+
+    @property
+    def description(self) -> str:
+        return "Retrieve recent message history from a Telegram chat."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "string",
+                    "description": "Chat ID to get history from",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Number of messages to retrieve (default 20)",
+                },
+                "offset_id": {
+                    "type": "integer",
+                    "description": "Offset message ID for pagination",
+                },
+            },
+            "required": ["chat_id"],
+        }
+
+    async def execute(self, **kwargs: Any) -> str:
+        results = await self._channel.get_message_history(
+            chat_id=kwargs["chat_id"],
+            limit=kwargs.get("limit", 20),
+            offset_id=kwargs.get("offset_id", 0),
+        )
+        if not results:
+            return "No messages found"
+        return json.dumps(results, ensure_ascii=False)
