@@ -2,7 +2,7 @@
 """Telegram Client authentication helper.
 
 First-time login tool that creates a persistent session file for the
-telegram_client channel. Run this once before starting nanobot.
+telegram_userbot channel. Run this once before starting nanobot.
 
 Usage:
     # Interactive login (saves .session file)
@@ -11,7 +11,7 @@ Usage:
     # Export StringSession (for Docker / serverless)
     python auth.py --api-id 12345 --phone +8613800138000 --export-string
 
-    # Custom session name (default: nanobot_client)
+    # Custom session name (default: nanobot_userbot)
     python auth.py --api-id 12345 --phone +8613800138000 --session my_session
 
     # With proxy
@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api-id", type=int, required=True, help="API ID from my.telegram.org")
     parser.add_argument("--api-hash", type=str, default=None, help="API hash (will prompt securely if not provided)")
     parser.add_argument("--phone", type=str, required=True, help="Phone number with country code (e.g. +8613800138000)")
-    parser.add_argument("--session", type=str, default="nanobot_client", help="Session name (default: nanobot_client)")
+    parser.add_argument("--session", type=str, default="nanobot_userbot", help="Session name (default: nanobot_userbot)")
     parser.add_argument("--proxy", type=str, default=None, help="Proxy URL (e.g. socks5://127.0.0.1:1080)")
     parser.add_argument("--export-string", action="store_true", help="Export StringSession after login")
     return parser.parse_args()
@@ -91,7 +91,7 @@ async def authenticate(args: argparse.Namespace) -> None:
     if args.proxy:
         try:
             sys.path.insert(0, str(Path(__file__).parent))
-            from channel.telegram_client import parse_proxy_url
+            from channel.telegram_userbot import parse_proxy_url
             proxy = parse_proxy_url(args.proxy)
         except ImportError:
             from urllib.parse import urlparse

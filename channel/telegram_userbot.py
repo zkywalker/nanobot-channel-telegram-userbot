@@ -1,4 +1,4 @@
-"""Telegram Client API channel using Telethon (MTProto user account).
+"""Telegram Userbot API channel using Telethon (MTProto user account).
 
 This channel allows nanobot to operate as a regular Telegram user account
 instead of a bot. It uses the Telethon library to connect via MTProto protocol.
@@ -6,7 +6,7 @@ instead of a bot. It uses the Telethon library to connect via MTProto protocol.
 Architecture:
 - Standalone utility functions live in channel/utils.py and are
   framework-agnostic — import them directly for openclaw or other integrations.
-- The TelegramClientChannel class integrates with nanobot's BaseChannel.
+- The TelegramUserbotChannel class integrates with nanobot's BaseChannel.
   For other frameworks, only the nanobot imports (bottom of import section)
   need to be replaced.
 
@@ -43,12 +43,12 @@ try:
     )
 except ImportError:
     raise ImportError(
-        "telethon is required for the telegram_client channel. "
+        "telethon is required for the telegram_userbot channel. "
         "Install it with: pip install telethon"
     )
 
 # --- Shared utilities (framework-agnostic, reusable by openclaw) ---
-from nanobot.channels.telegram_client_utils import (
+from nanobot.channels.telegram_userbot_utils import (
     TELEGRAM_MAX_MESSAGE_LEN,
     TELEGRAM_REPLY_CONTEXT_MAX_LEN,
     detect_media_type,
@@ -72,15 +72,15 @@ from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
 
-class TelegramClientConfig(BaseModel):
-    """Telegram Client API (user account) channel configuration."""
+class TelegramUserbotConfig(BaseModel):
+    """Telegram Userbot API (user account) channel configuration."""
 
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
     enabled: bool = False
     api_id: int = 0  # From https://my.telegram.org
     api_hash: str = ""  # From https://my.telegram.org
-    session_name: str = "nanobot_client"  # SQLite session file name (without .session)
+    session_name: str = "nanobot_userbot"  # SQLite session file name (without .session)
     session_string: str = ""  # Pre-auth StringSession (alternative to file-based)
     phone: str = ""  # Phone number for interactive auth (e.g. +8613800138000)
     proxy: str | None = None  # Proxy URL: socks5://host:port or http://host:port
@@ -95,7 +95,7 @@ class TelegramClientConfig(BaseModel):
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_SESSION_NAME = "telegram_client"
+DEFAULT_SESSION_NAME = "telegram_userbot"
 # Messages older than this (seconds) at startup are considered stale
 STALE_MESSAGE_THRESHOLD = 60
 # Max recent messages to fetch for context
@@ -103,11 +103,11 @@ MAX_HISTORY_CONTEXT = 20
 
 
 # ---------------------------------------------------------------------------
-# TelegramClientChannel
+# TelegramUserbotChannel
 # ---------------------------------------------------------------------------
 
 
-class TelegramClientChannel(BaseChannel):
+class TelegramUserbotChannel(BaseChannel):
     """Telegram channel using Telethon (Client API / MTProto).
 
     Operates as a user account. Supports private chats, groups, supergroups,
@@ -127,9 +127,9 @@ class TelegramClientChannel(BaseChannel):
     Use a dedicated secondary account.
     """
 
-    name = "telegram_client"
-    display_name = "Telegram Client"
-    config_class = TelegramClientConfig  # Used by nanobot's plugin channel loader
+    name = "telegram_userbot"
+    display_name = "Telegram Userbot"
+    config_class = TelegramUserbotConfig  # Used by nanobot's plugin channel loader
 
     def __init__(self, config: Any, bus: MessageBus):
         super().__init__(config, bus)
@@ -151,7 +151,7 @@ class TelegramClientChannel(BaseChannel):
         """Build a Telethon session object from config."""
         session_string = getattr(self.config, "session_string", "")
         if session_string:
-            logger.info("Using StringSession for Telegram Client")
+            logger.info("Using StringSession for Telegram Userbot")
             return StringSession(session_string)
 
         session_name = getattr(self.config, "session_name", DEFAULT_SESSION_NAME)
@@ -191,7 +191,7 @@ class TelegramClientChannel(BaseChannel):
         api_hash = getattr(self.config, "api_hash", "")
         if not api_id or not api_hash:
             logger.error(
-                "Telegram Client: api_id and api_hash are required. "
+                "Telegram Userbot: api_id and api_hash are required. "
                 "Get them from https://my.telegram.org"
             )
             return
@@ -217,14 +217,14 @@ class TelegramClientChannel(BaseChannel):
             if not await self._client.is_user_authorized():
                 if not phone:
                     logger.error(
-                        "Telegram Client: not authenticated and no phone number configured. "
+                        "Telegram Userbot: not authenticated and no phone number configured. "
                         "Run auth.py first or set 'phone' in config."
                     )
                     await self._client.disconnect()
                     self._running = False
                     return
 
-                logger.info("Telegram Client: sending verification code to {}...", phone)
+                logger.info("Telegram Userbot: sending verification code to {}...", phone)
                 await self._client.send_code_request(phone)
 
                 code = await self._async_input(
@@ -240,15 +240,15 @@ class TelegramClientChannel(BaseChannel):
                     )
                     await self._client.sign_in(password=password)
 
-                logger.info("Telegram Client: authenticated successfully")
+                logger.info("Telegram Userbot: authenticated successfully")
 
         except FloodWaitError as e:
-            logger.error("Telegram Client: flood wait {} seconds. Try again later.", e.seconds)
+            logger.error("Telegram Userbot: flood wait {} seconds. Try again later.", e.seconds)
             await self._client.disconnect()
             self._running = False
             return
         except Exception as e:
-            logger.error("Telegram Client: authentication failed: {}", e)
+            logger.error("Telegram Userbot: authentication failed: {}", e)
             if self._client.is_connected():
                 await self._client.disconnect()
             self._running = False
@@ -262,7 +262,7 @@ class TelegramClientChannel(BaseChannel):
         self._me_id = self._me.id
         self._me_username = getattr(self._me, "username", None)
         logger.info(
-            "Telegram Client: logged in as {} (ID: {})",
+            "Telegram Userbot: logged in as {} (ID: {})",
             self._me_username or self._me.first_name,
             self._me_id,
         )
@@ -272,23 +272,23 @@ class TelegramClientChannel(BaseChannel):
         self._client.add_event_handler(self._on_message_edited, events.MessageEdited)
         self._client.add_event_handler(self._on_callback_query, events.CallbackQuery)
 
-        logger.info("Telegram Client channel started")
+        logger.info("Telegram Userbot channel started")
 
         # Keep alive with connection health check
         try:
             while self._running:
                 await asyncio.sleep(5)
                 if self._client and not self._client.is_connected():
-                    logger.warning("Telegram Client: connection lost, attempting reconnect...")
+                    logger.warning("Telegram Userbot: connection lost, attempting reconnect...")
                     try:
                         await self._client.connect()
                         if await self._client.is_user_authorized():
-                            logger.info("Telegram Client: reconnected successfully")
+                            logger.info("Telegram Userbot: reconnected successfully")
                         else:
-                            logger.error("Telegram Client: session expired, cannot reconnect")
+                            logger.error("Telegram Userbot: session expired, cannot reconnect")
                             self._running = False
                     except Exception as e:
-                        logger.error("Telegram Client: reconnect failed: {}", e)
+                        logger.error("Telegram Userbot: reconnect failed: {}", e)
                         await asyncio.sleep(10)
         except asyncio.CancelledError:
             pass
@@ -316,7 +316,7 @@ class TelegramClientChannel(BaseChannel):
         self._media_group_buffers.clear()
 
         if self._client:
-            logger.info("Stopping Telegram Client...")
+            logger.info("Stopping Telegram Userbot...")
             await self._client.disconnect()
             self._client = None
 
@@ -482,7 +482,7 @@ class TelegramClientChannel(BaseChannel):
 
     def _get_media_dir(self) -> Path:
         """Get media download directory. Override-friendly for other frameworks."""
-        return get_media_dir("telegram_client")
+        return get_media_dir("telegram_userbot")
 
     async def _download_event_media(
         self, event_or_msg: Any, *, add_failure_content: bool = False
@@ -587,7 +587,7 @@ class TelegramClientChannel(BaseChannel):
         if topic_id is None:
             return None
         chat_id = event.chat_id
-        return f"telegram_client:{chat_id}:topic:{topic_id}"
+        return f"telegram_userbot:{chat_id}:topic:{topic_id}"
 
     def _get_thread_id(self, chat_id: str, message_id: int | None) -> int | None:
         """Look up cached topic thread ID for outbound routing."""
@@ -708,7 +708,7 @@ class TelegramClientChannel(BaseChannel):
                 logger.debug("Failed to get reply message: {}", e)
 
         content = "\n".join(content_parts) if content_parts else "[empty message]"
-        logger.debug("Telegram Client message from {}: {}...", sender_id, content[:50])
+        logger.debug("Telegram Userbot message from {}: {}...", sender_id, content[:50])
 
         metadata = self._build_message_metadata(event, sender)
         session_key = self._derive_topic_session_key(event)
@@ -1070,9 +1070,9 @@ class TelegramClientChannel(BaseChannel):
     # ---- outbound message sending ----------------------------------------
 
     async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through Telegram Client API."""
+        """Send a message through Telegram Userbot API."""
         if not self._client:
-            logger.warning("Telegram Client not running")
+            logger.warning("Telegram Userbot not running")
             return
 
         if not msg.metadata.get("_progress", False):
@@ -1182,5 +1182,5 @@ class TelegramClientChannel(BaseChannel):
             except FloodWaitError as fw:
                 logger.error("Flood wait: {} seconds. Message to {} dropped.", fw.seconds, chat_id)
             except Exception as e2:
-                logger.error("Error sending Telegram Client message: {}", e2)
+                logger.error("Error sending Telegram Userbot message: {}", e2)
         return None

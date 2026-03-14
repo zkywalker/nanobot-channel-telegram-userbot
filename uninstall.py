@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Uninstall telegram_client channel from nanobot.
+"""Uninstall telegram_userbot channel from nanobot.
 
 Removes symlinks created by install.py.  No source files are modified.
 """
@@ -53,16 +53,16 @@ def _remove_symlink(target: Path) -> None:
 def remove_symlinks(nanobot_dir: Path) -> None:
     """Remove channel module and utils symlinks."""
     channels_dir = nanobot_dir / "nanobot" / "channels"
-    _remove_symlink(channels_dir / "telegram_client.py")
-    _remove_symlink(channels_dir / "telegram_client_utils.py")
+    _remove_symlink(channels_dir / "telegram_userbot.py")
+    _remove_symlink(channels_dir / "telegram_userbot_utils.py")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Uninstall telegram_client channel from nanobot")
+    parser = argparse.ArgumentParser(description="Uninstall telegram_userbot channel from nanobot")
     parser.add_argument("--nanobot-dir", type=str, default=None, help="Path to nanobot source directory")
     args = parser.parse_args()
 
-    print("Uninstalling telegram_client channel...\n")
+    print("Uninstalling telegram_userbot channel...\n")
 
     try:
         nanobot_dir = find_nanobot_dir(args.nanobot_dir)
